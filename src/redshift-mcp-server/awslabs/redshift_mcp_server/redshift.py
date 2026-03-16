@@ -17,6 +17,7 @@
 import asyncio
 import boto3
 import os
+import redshift_connector
 import regex
 import time
 from awslabs.redshift_mcp_server import __version__
@@ -42,15 +43,54 @@ class RedshiftClientManager:
     """Manages AWS clients for Redshift operations."""
 
     def __init__(
-        self, config: Config, aws_region: str | None = None, aws_profile: str | None = None
+        self,
+        config: Config,
+        aws_region: str | None = None,
+        aws_profile: str | None = None,
+        secret_arn: str | None = None,
+        db_user: str | None = None,
+        redshift_host: str | None = None,
+        redshift_port: int = 5439,
+        redshift_user: str | None = None,
+        redshift_password: str | None = None,
+        redshift_database: str = 'dev',
     ):
         """Initialize the client manager."""
         self.aws_region = aws_region
         self.aws_profile = aws_profile
+        self.secret_arn = secret_arn
+        self.db_user = db_user
+        self.redshift_host = redshift_host
+        self.redshift_port = redshift_port
+        self.redshift_user = redshift_user
+        self.redshift_password = redshift_password
+        self.redshift_database = redshift_database
         self._redshift_client = None
         self._redshift_serverless_client = None
         self._redshift_data_client = None
         self._config = config
+
+    @property
+    def use_direct_connection(self) -> bool:
+        """Check if direct connection mode is active."""
+        return bool(self.redshift_host and self.redshift_user and self.redshift_password)
+
+    def get_direct_connection(self, database: str | None = None) -> redshift_connector.Connection:
+        """Create a new direct connection to Redshift via redshift_connector.
+
+        Args:
+            database: Database name to connect to. Defaults to configured database.
+
+        Returns:
+            A redshift_connector Connection object.
+        """
+        return redshift_connector.connect(
+            host=self.redshift_host,
+            port=self.redshift_port,
+            user=self.redshift_user,
+            password=self.redshift_password,
+            database=database or self.redshift_database,
+        )
 
     def redshift_client(self):
         """Get or create the Redshift client for provisioned clusters."""
@@ -197,6 +237,64 @@ class RedshiftSessionManager:
         return (time.time() - session_info['created_at']) > self._session_keepalive
 
 
+def _execute_statement_direct(
+    sql: str,
+    database_name: str,
+    parameters: list[dict] | None = None,
+) -> dict:
+    """Execute a SQL statement via direct redshift_connector connection.
+
+    Args:
+        sql: The SQL statement to execute.
+        database_name: The database to connect to.
+        parameters: Optional list of parameter dicts with 'name' and 'value' keys
+                    (Data API format). Converted to redshift_connector format internally.
+
+    Returns:
+        Dictionary mimicking Data API get_statement_result format with
+        'ColumnMetadata' and 'Records' keys.
+    """
+    conn = client_manager.get_direct_connection(database=database_name)
+    try:
+        cursor = conn.cursor()
+
+        # Convert Data API parameter format to positional parameters
+        if parameters:
+            # Replace :name placeholders with %s and build ordered values list
+            param_values = {p['name']: p['value'] for p in parameters}
+            ordered_values = []
+            converted_sql = sql
+            for name, value in param_values.items():
+                converted_sql = converted_sql.replace(f':{name}', '%s')
+                ordered_values.append(value)
+            cursor.execute(converted_sql, tuple(ordered_values))
+        else:
+            cursor.execute(sql)
+
+        # Build result in Data API format
+        result: dict = {'ColumnMetadata': [], 'Records': []}
+
+        if cursor.description:
+            result['ColumnMetadata'] = [{'name': col[0]} for col in cursor.description]
+            rows = cursor.fetchall()
+            for row in rows:
+                record = []
+                for v in row:
+                    if v is None:
+                        record.append({'isNull': True})
+                    else:
+                        record.append({'stringValue': str(v)})
+                result['Records'].append(record)
+
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 async def _execute_protected_statement(
     cluster_identifier: str,
     database_name: str,
@@ -210,7 +308,10 @@ async def _execute_protected_statement(
     based on allow_read_write flag. Transaction breaker protection is implemented
     to prevent unauthorized modifications.
 
-    The SQL execution takes the form:
+    When using direct connection mode (redshift_connector), sessions are not used.
+    The transaction is managed via explicit BEGIN/COMMIT/ROLLBACK on the connection.
+
+    When using Data API mode, the SQL execution takes the form:
     1. Get or create session (with SET application_name)
     2. BEGIN [READ ONLY|READ WRITE];
     3. <user sql>
@@ -231,6 +332,64 @@ async def _execute_protected_statement(
     Raises:
         Exception: If cluster not found, query fails, or times out.
     """
+    # Check for suspicious patterns in read-only mode
+    if not allow_read_write:
+        if regex.compile(SUSPICIOUS_QUERY_REGEXP).search(sql):
+            logger.error(f'SQL contains suspicious pattern, execution rejected: {sql}')
+            raise Exception(f'SQL contains suspicious pattern, execution rejected: {sql}')
+
+    # Direct connection mode: use redshift_connector
+    if client_manager.use_direct_connection:
+        conn = client_manager.get_direct_connection(database=database_name)
+        try:
+            cursor = conn.cursor()
+
+            # Begin transaction
+            begin_sql = 'BEGIN READ WRITE;' if allow_read_write else 'BEGIN READ ONLY;'
+            cursor.execute(begin_sql)
+
+            # Convert parameters and execute user SQL
+            if parameters:
+                param_values = {p['name']: p['value'] for p in parameters}
+                ordered_values = []
+                converted_sql = sql
+                for name, value in param_values.items():
+                    converted_sql = converted_sql.replace(f':{name}', '%s')
+                    ordered_values.append(value)
+                cursor.execute(converted_sql, tuple(ordered_values))
+            else:
+                cursor.execute(sql)
+
+            # Build result in Data API format
+            result: dict = {'ColumnMetadata': [], 'Records': []}
+            if cursor.description:
+                result['ColumnMetadata'] = [{'name': col[0]} for col in cursor.description]
+                rows = cursor.fetchall()
+                for row in rows:
+                    record = []
+                    for v in row:
+                        if v is None:
+                            record.append({'isNull': True})
+                        else:
+                            record.append({'stringValue': str(v)})
+                    result['Records'].append(record)
+
+            # End transaction
+            cursor.execute('END;')
+            conn.commit()
+
+            query_id = f'direct-{id(conn)}'
+            return result, query_id
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception as rollback_err:
+                logger.error(f'Rollback failed: {rollback_err}')
+            raise
+        finally:
+            conn.close()
+
+    # Data API mode: use existing session-based logic
     # Get cluster info
     clusters = await discover_clusters()
     cluster_info = None
@@ -246,12 +405,6 @@ async def _execute_protected_statement(
 
     # Get session (creates if needed, sets app name automatically)
     session_id = await session_manager.session(cluster_identifier, database_name, cluster_info)
-
-    # Check for suspicious patterns in read-only mode
-    if not allow_read_write:
-        if regex.compile(SUSPICIOUS_QUERY_REGEXP).search(sql):
-            logger.error(f'SQL contains suspicious pattern, execution rejected: {sql}')
-            raise Exception(f'SQL contains suspicious pattern, execution rejected: {sql}')
 
     # Execute BEGIN statement
     begin_sql = 'BEGIN READ WRITE;' if allow_read_write else 'BEGIN READ ONLY;'
@@ -397,10 +550,14 @@ async def _execute_statement(
 async def discover_clusters() -> list[dict]:
     """Discover all Redshift clusters and serverless workgroups.
 
+    When direct connection mode is active and AWS API calls fail (e.g. no credentials),
+    returns a single synthetic cluster entry built from the configured env vars.
+
     Returns:
         List of cluster information dictionaries.
     """
     clusters = []
+    aws_discovery_failed = False
 
     try:
         # Get provisioned clusters
@@ -432,49 +589,78 @@ async def discover_clusters() -> list[dict]:
 
     except Exception as e:
         logger.error(f'Error discovering provisioned clusters: {str(e)}')
-        raise
+        if not client_manager.use_direct_connection:
+            raise
+        aws_discovery_failed = True
 
-    try:
-        # Get serverless workgroups
-        logger.debug('Discovering Redshift Serverless workgroups')
-        serverless_client = client_manager.redshift_serverless_client()
+    if not aws_discovery_failed:
+        try:
+            # Get serverless workgroups
+            logger.debug('Discovering Redshift Serverless workgroups')
+            serverless_client = client_manager.redshift_serverless_client()
 
-        paginator = serverless_client.get_paginator('list_workgroups')
-        for page in paginator.paginate():
-            for workgroup in page.get('workgroups', []):
-                # Get detailed workgroup information
-                workgroup_detail = serverless_client.get_workgroup(
-                    workgroupName=workgroup['workgroupName']
-                )['workgroup']
+            paginator = serverless_client.get_paginator('list_workgroups')
+            for page in paginator.paginate():
+                for workgroup in page.get('workgroups', []):
+                    # Get detailed workgroup information
+                    workgroup_detail = serverless_client.get_workgroup(
+                        workgroupName=workgroup['workgroupName']
+                    )['workgroup']
 
-                cluster_info = {
-                    'identifier': workgroup['workgroupName'],
-                    'type': 'serverless',
-                    'status': workgroup['status'],
-                    'database_name': workgroup_detail.get('configParameters', [{}])[0].get(
-                        'parameterValue', 'dev'
-                    ),
-                    'endpoint': workgroup_detail.get('endpoint', {}).get('address'),
-                    'port': workgroup_detail.get('endpoint', {}).get('port'),
-                    'vpc_id': workgroup_detail.get('subnetIds', [None])[
-                        0
-                    ],  # Approximate VPC from subnet
-                    'node_type': None,  # Not applicable for serverless
-                    'number_of_nodes': None,  # Not applicable for serverless
-                    'creation_time': workgroup.get('creationDate'),
-                    'master_username': None,  # Serverless uses IAM
-                    'publicly_accessible': workgroup_detail.get('publiclyAccessible'),
-                    'encrypted': True,  # Serverless is always encrypted
-                    'tags': {tag['key']: tag['value'] for tag in workgroup_detail.get('tags', [])},
-                }
-                clusters.append(cluster_info)
+                    cluster_info = {
+                        'identifier': workgroup['workgroupName'],
+                        'type': 'serverless',
+                        'status': workgroup['status'],
+                        'database_name': workgroup_detail.get('configParameters', [{}])[0].get(
+                            'parameterValue', 'dev'
+                        ),
+                        'endpoint': workgroup_detail.get('endpoint', {}).get('address'),
+                        'port': workgroup_detail.get('endpoint', {}).get('port'),
+                        'vpc_id': workgroup_detail.get('subnetIds', [None])[
+                            0
+                        ],  # Approximate VPC from subnet
+                        'node_type': None,  # Not applicable for serverless
+                        'number_of_nodes': None,  # Not applicable for serverless
+                        'creation_time': workgroup.get('creationDate'),
+                        'master_username': None,  # Serverless uses IAM
+                        'publicly_accessible': workgroup_detail.get('publiclyAccessible'),
+                        'encrypted': True,  # Serverless is always encrypted
+                        'tags': {
+                            tag['key']: tag['value'] for tag in workgroup_detail.get('tags', [])
+                        },
+                    }
+                    clusters.append(cluster_info)
 
-        serverless_count = len([c for c in clusters if c['type'] == 'serverless'])
-        logger.info(f'Found {serverless_count} serverless workgroups')
+            serverless_count = len([c for c in clusters if c['type'] == 'serverless'])
+            logger.info(f'Found {serverless_count} serverless workgroups')
 
-    except Exception as e:
-        logger.error(f'Error discovering serverless workgroups: {str(e)}')
-        raise
+        except Exception as e:
+            logger.error(f'Error discovering serverless workgroups: {str(e)}')
+            if not client_manager.use_direct_connection:
+                raise
+            aws_discovery_failed = True
+
+    # If AWS discovery failed but direct connection is configured, return synthetic entry
+    if aws_discovery_failed and client_manager.use_direct_connection:
+        logger.info('AWS discovery failed, using direct connection config as cluster entry')
+        clusters = [
+            {
+                'identifier': client_manager.redshift_host,
+                'type': 'provisioned',
+                'status': 'available',
+                'database_name': client_manager.redshift_database,
+                'endpoint': client_manager.redshift_host,
+                'port': client_manager.redshift_port,
+                'vpc_id': None,
+                'node_type': None,
+                'number_of_nodes': None,
+                'creation_time': None,
+                'master_username': client_manager.redshift_user,
+                'publicly_accessible': None,
+                'encrypted': None,
+                'tags': {},
+            }
+        ]
 
     logger.info(f'Total clusters discovered: {len(clusters)}')
     return clusters
@@ -697,7 +883,7 @@ async def discover_columns(
         raise
 
 
-async def execute_query(cluster_identifier: str, database_name: str, sql: str) -> dict:
+async def execute_query(cluster_identifier: str, database_name: str, sql: str, allow_read_write: bool = False) -> dict:
     """Execute a SQL query against a Redshift cluster using the Data API.
 
     Args:
@@ -719,7 +905,8 @@ async def execute_query(cluster_identifier: str, database_name: str, sql: str) -
 
         # Execute the query using the common function
         results_response, query_id = await _execute_protected_statement(
-            cluster_identifier=cluster_identifier, database_name=database_name, sql=sql
+            cluster_identifier=cluster_identifier, database_name=database_name, sql=sql,
+            allow_read_write=allow_read_write,
         )
 
         # Calculate execution time
@@ -783,6 +970,11 @@ client_manager = RedshiftClientManager(
     ),
     aws_region=os.environ.get('AWS_REGION'),
     aws_profile=os.environ.get('AWS_PROFILE'),
+    redshift_host=os.environ.get('MCP_REDSHIFT_HOST'),
+    redshift_port=int(os.environ.get('MCP_REDSHIFT_PORT', '5439')),
+    redshift_user=os.environ.get('MCP_REDSHIFT_USER'),
+    redshift_password=os.environ.get('MCP_REDSHIFT_PASSWORD'),
+    redshift_database=os.environ.get('MCP_REDSHIFT_DATABASE', 'dev'),
 )
 
 # Global session manager instance

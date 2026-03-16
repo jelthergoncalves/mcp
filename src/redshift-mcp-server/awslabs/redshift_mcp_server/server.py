@@ -623,6 +623,57 @@ async def execute_query_tool(
         raise
 
 
+@mcp.tool(name='execute_query_rw')
+async def execute_query_rw_tool(
+    ctx: Context,
+    cluster_identifier: str = Field(
+        ...,
+        description='The cluster identifier to execute the query on. Must be a valid cluster identifier from the list_clusters tool.',
+    ),
+    database_name: str = Field(
+        ...,
+        description='The database name to execute the query against. Must be a valid database name from the list_databases tool.',
+    ),
+    sql: str = Field(
+        ..., description='The SQL statement to execute. Should be a single SQL statement.'
+    ),
+) -> QueryResult:
+    """Execute a SQL query in READ WRITE transaction mode.
+
+    Use this tool instead of execute_query when querying Redshift Spectrum external tables
+    (e.g., tables in the 'cloudquery' external schema backed by AWS Glue catalog).
+
+    Spectrum external tables require READ WRITE mode because Redshift needs to incorporate
+    new or updated Glue catalog entries into its local catalog on first access, which is a
+    write operation that fails inside a READ ONLY transaction.
+
+    The connected user's Redshift permissions still govern what operations are allowed.
+    A read-only user cannot INSERT/UPDATE/DELETE even in a READ WRITE transaction.
+    """
+    try:
+        logger.info(f'Executing read-write query on cluster {cluster_identifier} in database {database_name}')
+        query_result_data = await execute_query(
+            cluster_identifier=cluster_identifier,
+            database_name=database_name,
+            sql=sql,
+            allow_read_write=True,
+        )
+
+        query_result = QueryResult(**query_result_data)
+
+        logger.info(
+            f'Successfully executed read-write query on cluster {cluster_identifier}: {query_result.row_count} rows returned in {query_result.execution_time_ms}ms'
+        )
+        return query_result
+
+    except Exception as e:
+        logger.error(f'Error in execute_query_rw_tool: {str(e)}')
+        await ctx.error(
+            f'Failed to execute read-write query on cluster {cluster_identifier} in database {database_name}: {str(e)}'
+        )
+        raise
+
+
 def main():
     """Run the MCP server with CLI argument support."""
     mcp.run()
