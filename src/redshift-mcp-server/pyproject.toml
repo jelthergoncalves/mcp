@@ -13,6 +13,7 @@ dependencies = [
     "loguru>=0.7.0",
     "mcp[cli]>=1.23.0",
     "pydantic>=2.10.6",
+    "redshift_connector>=2.1.0",
     "regex>=2024.11.6",
 ]
 license = {text = "Apache-2.0"}

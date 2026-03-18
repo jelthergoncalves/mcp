@@ -33,6 +33,7 @@ CLIENT_BEST_PRACTICES = """
 
 - Default AWS credentials chain (IAM roles, ~/.aws/credentials, etc.).
 - AWS_PROFILE environment variable (if set).
+- Direct username/password connection via MCP_REDSHIFT_HOST, MCP_REDSHIFT_USER, and MCP_REDSHIFT_PASSWORD environment variables. When all three are set, the server connects directly using redshift_connector instead of the Data API.
 - Region configuration (in order of precedence):
   - AWS_REGION environment variable (highest priority)
   - AWS_DEFAULT_REGION environment variable
@@ -59,6 +60,7 @@ REDSHIFT_BEST_PRACTICES = """
 ### Connection Guidelines
 
 - We are use the Redshift API and Redshift Data API.
+- Direct connection mode is available via MCP_REDSHIFT_HOST, MCP_REDSHIFT_USER, and MCP_REDSHIFT_PASSWORD environment variables using redshift_connector.
 - Leverage IAM authentication when possible instead of secrets (database passwords).
 """
 

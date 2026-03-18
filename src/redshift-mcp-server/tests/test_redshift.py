@@ -267,6 +267,7 @@ class TestExecuteProtectedStatement:
         mock_data_client = mocker.Mock()
         mock_data_client.get_statement_result.return_value = {'Records': [], 'ColumnMetadata': []}
         mock_client_manager = mocker.patch('awslabs.redshift_mcp_server.redshift.client_manager')
+        mock_client_manager.use_direct_connection = False
         mock_client_manager.redshift_data_client.return_value = mock_data_client
 
         result = await _execute_protected_statement(
@@ -310,6 +311,7 @@ class TestExecuteProtectedStatement:
         mock_data_client = mocker.Mock()
         mock_data_client.get_statement_result.return_value = {'Records': [], 'ColumnMetadata': []}
         mock_client_manager = mocker.patch('awslabs.redshift_mcp_server.redshift.client_manager')
+        mock_client_manager.use_direct_connection = False
         mock_client_manager.redshift_data_client.return_value = mock_data_client
 
         await _execute_protected_statement(
@@ -659,6 +661,7 @@ class TestRedshiftSessionManager:
         }
 
         mock_client_manager = mocker.patch('awslabs.redshift_mcp_server.redshift.client_manager')
+        mock_client_manager.use_direct_connection = False
         mock_client_manager.redshift_data_client.return_value = mock_data_client
 
         session_id = await session_manager.session('test-cluster', 'test-db', cluster_info)
@@ -690,6 +693,7 @@ class TestRedshiftSessionManager:
         }
 
         mock_client_manager = mocker.patch('awslabs.redshift_mcp_server.redshift.client_manager')
+        mock_client_manager.use_direct_connection = False
         mock_client_manager.redshift_data_client.return_value = mock_data_client
 
         session_id = await session_manager.session('test-workgroup', 'test-db', cluster_info)
@@ -715,6 +719,7 @@ class TestRedshiftSessionManager:
         }
 
         mock_client_manager = mocker.patch('awslabs.redshift_mcp_server.redshift.client_manager')
+        mock_client_manager.use_direct_connection = False
         mock_client_manager.redshift_data_client.return_value = mock_data_client
 
         # First call creates session
