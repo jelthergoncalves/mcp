@@ -17,9 +17,7 @@
 import os
 import sys
 from awslabs.redshift_mcp_server.consts import (
-    CLIENT_BEST_PRACTICES,
     DEFAULT_LOG_LEVEL,
-    REDSHIFT_BEST_PRACTICES,
 )
 from awslabs.redshift_mcp_server.models import (
     QueryResult,
@@ -37,8 +35,11 @@ from awslabs.redshift_mcp_server.redshift import (
     discover_tables,
     execute_query,
 )
+from awslabs.redshift_mcp_server.review.executor import review_cluster
+from awslabs.redshift_mcp_server.review.models import ReviewResult
 from loguru import logger
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.types import ToolAnnotations
 from pydantic import Field
 
 
@@ -52,7 +53,7 @@ logger.add(
 
 mcp = FastMCP(
     'awslabs.redshift-mcp-server',
-    instructions=f"""
+    instructions="""
 # Amazon Redshift MCP Server.
 
 This MCP server provides comprehensive access to Amazon Redshift clusters and serverless workgroups.
@@ -65,23 +66,28 @@ This tool provides essential information needed to connect to and query your Red
 
 ### list_databases
 Lists all databases in a specified Redshift cluster.
-This tool queries the SVV_REDSHIFT_DATABASES system view to discover available databases.
+This tool runs the SHOW DATABASES command to discover available databases.
 
 ### list_schemas
 Lists all schemas in a specified database within a Redshift cluster.
-This tool queries the SVV_ALL_SCHEMAS system view to discover available schemas.
+This tool runs the SHOW SCHEMAS command to discover available schemas.
 
 ### list_tables
 Lists all tables in a specified schema within a Redshift database.
-This tool queries the SVV_ALL_TABLES system view to discover available tables.
+This tool runs the SHOW TABLES command to discover available tables.
 
 ### list_columns
 Lists all columns in a specified table within a Redshift schema.
-This tool queries the SVV_ALL_COLUMNS system view to discover available columns.
+This tool runs the SHOW COLUMNS command to discover available columns.
 
 ### execute_query
 Executes SQL queries against a Redshift cluster or serverless workgroup.
 This tool uses the Redshift Data API to run queries and return results.
+
+### review_cluster
+Runs a diagnostic review of a Redshift cluster or serverless workgroup.
+Returns identified potential issues and respective recommendations ordered by required mitigation effort.
+Requires the connected database user to hold the sys:monitor role (or be a superuser).
 
 ## Getting Started
 
@@ -89,14 +95,64 @@ This tool uses the Redshift Data API to run queries and return results.
 2. Use the list_clusters tool to discover available Redshift instances.
 3. Note the cluster identifiers for use with other tools (coming in future milestones).
 
-{CLIENT_BEST_PRACTICES}
-{REDSHIFT_BEST_PRACTICES}
+## Session Management and Concurrency
+
+The server reuses one Redshift Data API session per `cluster:database`:
+- Queries to the same `cluster:database` are serialized (parallel calls queue; a long-running query blocks later ones to that target).
+- Queries to different targets run concurrently on independent sessions.
+- Each read-only query runs isolated in its own transaction.
+
+## AWS Client Best Practices
+
+### Authentication and Configuration
+
+- Default AWS credentials chain (IAM roles, ~/.aws/credentials, etc.).
+- AWS_PROFILE environment variable (if set).
+- Region configuration (in order of precedence):
+  - AWS_REGION environment variable (highest priority)
+  - AWS_DEFAULT_REGION environment variable
+  - Region specified in AWS profile configuration
+
+### Error Handling
+
+- Always print out AWS client errors in full to help diagnose configuration issues.
+- For region-related errors, suggest checking AWS_REGION, AWS_DEFAULT_REGION, or AWS profile configuration.
+- For credential errors, suggest verifying AWS credentials setup and permissions.
+
+## Amazon Redshift Best Practices
+
+### Query Guidelines
+
+- Always specify the database and schema when referencing objects to avoid ambiguity.
+- Leverage distribution in WHERE and JOIN predicates and sort keys in ORDER BY for optimal query performance.
+- Use LIMIT clauses for exploratory queries to avoid large result sets.
+- Analyze table to update table statistics if it is not updated or too off before making a decision on the query structure.
+- Prefer explicitly specifying columns in SELECT over "*" for better performance.
+
+### Connection Guidelines
+
+- We use the Redshift API and Redshift Data API.
+- Leverage IAM authentication when possible instead of secrets (database passwords).
 """,
-    dependencies=['boto3', 'loguru', 'pydantic', 'regex'],
+    dependencies=['boto3', 'loguru', 'pydantic', 'sqlglot'],
 )
 
 
-@mcp.tool(name='list_clusters')
+def _read_only_annotations(title: str) -> ToolAnnotations:
+    """Return annotations for tools that only read the caller's AWS environment."""
+    return ToolAnnotations(
+        title=title,
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    )
+
+
+@mcp.tool(
+    name='list_clusters',
+    annotations=_read_only_annotations('List Redshift clusters and workgroups'),
+)
 async def list_clusters_tool(ctx: Context) -> list[RedshiftCluster]:
     """List all available Amazon Redshift clusters and serverless workgroups.
 
@@ -144,13 +200,7 @@ async def list_clusters_tool(ctx: Context) -> list[RedshiftCluster]:
     """
     try:
         logger.info('Discovering Redshift clusters and serverless workgroups')
-        clusters_data = await discover_clusters()
-
-        # Convert to RedshiftCluster models
-        clusters = []
-        for cluster_data in clusters_data:
-            cluster = RedshiftCluster(**cluster_data)
-            clusters.append(cluster)
+        clusters = await discover_clusters()
 
         logger.info(f'Successfully retrieved {len(clusters)} clusters')
         return clusters
@@ -161,7 +211,10 @@ async def list_clusters_tool(ctx: Context) -> list[RedshiftCluster]:
         raise
 
 
-@mcp.tool(name='list_databases')
+@mcp.tool(
+    name='list_databases',
+    annotations=_read_only_annotations('List Redshift databases'),
+)
 async def list_databases_tool(
     ctx: Context,
     cluster_identifier: str = Field(
@@ -170,12 +223,12 @@ async def list_databases_tool(
     ),
     database_name: str = Field(
         'dev',
-        description='The database to connect to for querying system views. Defaults to "dev".',
+        description='The database to connect to for metadata discovery. Defaults to "dev".',
     ),
 ) -> list[RedshiftDatabase]:
     """List all databases in a specified Amazon Redshift cluster.
 
-    This tool queries the SVV_REDSHIFT_DATABASES system view to discover all databases
+    This tool runs the SHOW DATABASES command to discover all databases
     that the user has access to in the specified cluster, including local databases
     and databases created from datashares.
 
@@ -184,13 +237,13 @@ async def list_databases_tool(
     - Ensure your AWS credentials are properly configured (via AWS_PROFILE or default credentials).
     - The cluster must be available and accessible.
     - Required IAM permissions: redshift-data:ExecuteStatement, redshift-data:DescribeStatement, redshift-data:GetStatementResult.
-    - The user must have access to the specified database to query system views.
+    - The user must have access to the specified database to run the discovery commands.
 
     ## Parameters
 
     - cluster_identifier: The unique identifier of the Redshift cluster to query.
                          IMPORTANT: Use a valid cluster identifier from the list_clusters tool.
-    - database_name: The database to connect to for querying system views (defaults to 'dev').
+    - database_name: The database to connect to for metadata discovery (defaults to 'dev').
 
     ## Response Structure
 
@@ -200,7 +253,7 @@ async def list_databases_tool(
     - database_owner: The database owner user ID.
     - database_type: The type of database (local or shared).
     - database_acl: Access control information (for internal use).
-    - database_options: The properties of the database.
+    - parameters: The properties of the database.
     - database_isolation_level: The isolation level (Snapshot Isolation or Serializable).
 
     ## Usage Tips
@@ -209,6 +262,7 @@ async def list_databases_tool(
     2. Ensure the cluster status is 'available' before querying databases.
     3. Use the default database name unless you know a specific database exists.
     4. Note database types to understand if they are local or shared from datashares.
+    5. Shared (datashare) databases appear only if the connecting principal has been granted access to the consumer database (e.g. GRANT USAGE ON DATABASE <db> TO <principal>); otherwise they are omitted even though the datashare exists.
 
     ## Interpretation Best Practices
 
@@ -219,15 +273,9 @@ async def list_databases_tool(
     """
     try:
         logger.info(f'Discovering databases on cluster: {cluster_identifier}')
-        databases_data = await discover_databases(
+        databases = await discover_databases(
             cluster_identifier=cluster_identifier, database_name=database_name
         )
-
-        # Convert to RedshiftDatabase models
-        databases = []
-        for database_data in databases_data:
-            database = RedshiftDatabase(**database_data)
-            databases.append(database)
 
         logger.info(
             f'Successfully retrieved {len(databases)} databases from cluster {cluster_identifier}'
@@ -240,7 +288,10 @@ async def list_databases_tool(
         raise
 
 
-@mcp.tool(name='list_schemas')
+@mcp.tool(
+    name='list_schemas',
+    annotations=_read_only_annotations('List Redshift schemas'),
+)
 async def list_schemas_tool(
     ctx: Context,
     cluster_identifier: str = Field(
@@ -254,7 +305,7 @@ async def list_schemas_tool(
 ) -> list[RedshiftSchema]:
     """List all schemas in a specified database within a Redshift cluster.
 
-    This tool queries the SVV_ALL_SCHEMAS system view to discover all schemas
+    This tool runs the SHOW SCHEMAS command to discover all schemas
     that the user has access to in the specified database, including local schemas,
     external schemas, and shared schemas from datashares.
 
@@ -263,7 +314,7 @@ async def list_schemas_tool(
     - Ensure your AWS credentials are properly configured (via AWS_PROFILE or default credentials).
     - The cluster must be available and accessible.
     - Required IAM permissions: redshift-data:ExecuteStatement, redshift-data:DescribeStatement, redshift-data:GetStatementResult.
-    - The user must have access to the database to query system views.
+    - The user must have access to the database to run the discovery commands.
 
     ## Parameters
 
@@ -291,6 +342,7 @@ async def list_schemas_tool(
     3. Ensure the cluster status is 'available' before querying schemas.
     4. Note schema types to understand if they are local, external, or shared.
     5. External schemas connect to external data sources like S3 or other databases.
+    6. Schemas in a shared (datashare) database appear only if the connecting principal has been granted access to the consumer database (e.g. GRANT USAGE ON DATABASE <db> TO <principal>); otherwise they are omitted even though the datashare exists.
 
     ## Interpretation Best Practices
 
@@ -304,15 +356,9 @@ async def list_schemas_tool(
         logger.info(
             f'Discovering schemas in database {schema_database_name} on cluster {cluster_identifier}'
         )
-        schemas_data = await discover_schemas(
+        schemas = await discover_schemas(
             cluster_identifier=cluster_identifier, schema_database_name=schema_database_name
         )
-
-        # Convert to RedshiftSchema models
-        schemas = []
-        for schema_data in schemas_data:
-            schema = RedshiftSchema(**schema_data)
-            schemas.append(schema)
 
         logger.info(
             f'Successfully retrieved {len(schemas)} schemas from database {schema_database_name} on cluster {cluster_identifier}'
@@ -327,7 +373,10 @@ async def list_schemas_tool(
         raise
 
 
-@mcp.tool(name='list_tables')
+@mcp.tool(
+    name='list_tables',
+    annotations=_read_only_annotations('List Redshift tables'),
+)
 async def list_tables_tool(
     ctx: Context,
     cluster_identifier: str = Field(
@@ -345,7 +394,7 @@ async def list_tables_tool(
 ) -> list[RedshiftTable]:
     """List all tables in a specified schema within a Redshift database.
 
-    This tool queries the SVV_ALL_TABLES system view to discover all tables
+    This tool runs the SHOW TABLES command to discover all tables
     that the user has access to in the specified schema, including base tables,
     views, external tables, and shared tables.
 
@@ -354,7 +403,7 @@ async def list_tables_tool(
     - Ensure your AWS credentials are properly configured (via AWS_PROFILE or default credentials).
     - The cluster must be available and accessible.
     - Required IAM permissions: redshift-data:ExecuteStatement, redshift-data:DescribeStatement, redshift-data:GetStatementResult.
-    - The user must have access to the database to query system views.
+    - The user must have access to the database to run the discovery commands.
 
     ## Parameters
 
@@ -397,17 +446,11 @@ async def list_tables_tool(
         logger.info(
             f'Discovering tables in schema {table_schema_name} in database {table_database_name} on cluster {cluster_identifier}'
         )
-        tables_data = await discover_tables(
+        tables = await discover_tables(
             cluster_identifier=cluster_identifier,
             table_database_name=table_database_name,
             table_schema_name=table_schema_name,
         )
-
-        # Convert to RedshiftTable models
-        tables = []
-        for table_data in tables_data:
-            table = RedshiftTable(**table_data)
-            tables.append(table)
 
         logger.info(
             f'Successfully retrieved {len(tables)} tables from schema {table_schema_name} in database {table_database_name} on cluster {cluster_identifier}'
@@ -422,7 +465,10 @@ async def list_tables_tool(
         raise
 
 
-@mcp.tool(name='list_columns')
+@mcp.tool(
+    name='list_columns',
+    annotations=_read_only_annotations('List Redshift columns'),
+)
 async def list_columns_tool(
     ctx: Context,
     cluster_identifier: str = Field(
@@ -444,7 +490,7 @@ async def list_columns_tool(
 ) -> list[RedshiftColumn]:
     """List all columns in a specified table within a Redshift schema.
 
-    This tool queries the SVV_ALL_COLUMNS system view to discover all columns
+    This tool runs the SHOW COLUMNS command to discover all columns
     that the user has access to in the specified table, including detailed information
     about data types, constraints, and column properties.
 
@@ -453,7 +499,7 @@ async def list_columns_tool(
     - Ensure your AWS credentials are properly configured (via AWS_PROFILE or default credentials).
     - The cluster must be available and accessible.
     - Required IAM permissions: redshift-data:ExecuteStatement, redshift-data:DescribeStatement, redshift-data:GetStatementResult.
-    - The user must have access to the database to query system views.
+    - The user must have access to the database to run the discovery commands.
 
     ## Parameters
 
@@ -505,18 +551,12 @@ async def list_columns_tool(
         logger.info(
             f'Discovering columns in table {column_table_name} in schema {column_schema_name} in database {column_database_name} on cluster {cluster_identifier}'
         )
-        columns_data = await discover_columns(
+        columns = await discover_columns(
             cluster_identifier=cluster_identifier,
             column_database_name=column_database_name,
             column_schema_name=column_schema_name,
             column_table_name=column_table_name,
         )
-
-        # Convert to RedshiftColumn models
-        columns = []
-        for column_data in columns_data:
-            column = RedshiftColumn(**column_data)
-            columns.append(column)
 
         logger.info(
             f'Successfully retrieved {len(columns)} columns from table {column_table_name} in schema {column_schema_name} in database {column_database_name} on cluster {cluster_identifier}'
@@ -531,7 +571,10 @@ async def list_columns_tool(
         raise
 
 
-@mcp.tool(name='execute_query')
+@mcp.tool(
+    name='execute_query',
+    annotations=_read_only_annotations('Execute read-only Redshift query'),
+)
 async def execute_query_tool(
     ctx: Context,
     cluster_identifier: str = Field(
@@ -574,7 +617,6 @@ async def execute_query_tool(
     - columns: List of column names in the result set.
     - rows: List of rows, where each row is a list of values.
     - row_count: Number of rows returned.
-    - execution_time_ms: Query execution time in milliseconds.
     - query_id: Unique identifier for the query execution.
 
     ## Usage Tips
@@ -598,8 +640,8 @@ async def execute_query_tool(
 
     - Avoid dynamic SQL construction with user input.
     - Consider database object permissions.
-    - Currently, the execute_query tool runs the query in a READ ONLY transaction to prevent unintentional modifications.
-    - The READ WRITE mode will be added in the future versions with additional protection mechanisms.
+    - Queries run in read-only mode and must be a single statement; writes and
+      multi-statement submissions are rejected.
     """
     try:
         logger.info(f'Executing query on cluster {cluster_identifier} in database {database_name}')
@@ -611,7 +653,7 @@ async def execute_query_tool(
         query_result = QueryResult(**query_result_data)
 
         logger.info(
-            f'Successfully executed query on cluster {cluster_identifier}: {query_result.row_count} rows returned in {query_result.execution_time_ms}ms'
+            f'Successfully executed query on cluster {cluster_identifier}: {query_result.row_count} rows returned'
         )
         return query_result
 
@@ -651,7 +693,9 @@ async def execute_query_rw_tool(
     A read-only user cannot INSERT/UPDATE/DELETE even in a READ WRITE transaction.
     """
     try:
-        logger.info(f'Executing read-write query on cluster {cluster_identifier} in database {database_name}')
+        logger.info(
+            f'Executing read-write query on cluster {cluster_identifier} in database {database_name}'
+        )
         query_result_data = await execute_query(
             cluster_identifier=cluster_identifier,
             database_name=database_name,
@@ -662,7 +706,7 @@ async def execute_query_rw_tool(
         query_result = QueryResult(**query_result_data)
 
         logger.info(
-            f'Successfully executed read-write query on cluster {cluster_identifier}: {query_result.row_count} rows returned in {query_result.execution_time_ms}ms'
+            f'Successfully executed read-write query on cluster {cluster_identifier}: {query_result.row_count} rows returned'
         )
         return query_result
 
@@ -671,6 +715,45 @@ async def execute_query_rw_tool(
         await ctx.error(
             f'Failed to execute read-write query on cluster {cluster_identifier} in database {database_name}: {str(e)}'
         )
+        raise
+
+
+@mcp.tool(
+    name='review_cluster',
+    annotations=_read_only_annotations('Review Redshift cluster'),
+)
+async def review_cluster_tool(
+    ctx: Context,
+    cluster_identifier: str = Field(
+        ...,
+        description='The cluster identifier to run the review on. Must be a valid cluster identifier from the list_clusters tool.',
+    ),
+    database_name: str = Field(
+        'dev',
+        description='The database to connect to for querying system views. Defaults to "dev".',
+    ),
+) -> ReviewResult:
+    """Run a diagnostic review of a Redshift cluster or serverless workgroup.
+
+    Returns identified potential issues and respective recommendations
+    ordered by required mitigation effort.
+    """
+    try:
+        logger.info(f'Running review on cluster {cluster_identifier}, database {database_name}')
+
+        result = await review_cluster(
+            cluster_identifier=cluster_identifier,
+            execute_query_func=execute_query,
+            discover_clusters_func=discover_clusters,
+            database_name=database_name,
+            progress_reporter_func=ctx.report_progress,
+        )
+
+        return result
+
+    except Exception as e:
+        logger.error(f'Error in review_cluster_tool: {str(e)}')
+        await ctx.error(f'Failed to review cluster {cluster_identifier}: {str(e)}')
         raise
 
 

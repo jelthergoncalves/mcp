@@ -59,87 +59,44 @@ REDSHIFT_BEST_PRACTICES = """
 
 ### Connection Guidelines
 
-- We are use the Redshift API and Redshift Data API.
+- We use the Redshift API and Redshift Data API.
 - Direct connection mode is available via MCP_REDSHIFT_HOST, MCP_REDSHIFT_USER, and MCP_REDSHIFT_PASSWORD environment variables using redshift_connector.
 - Leverage IAM authentication when possible instead of secrets (database passwords).
 """
 
-# SQL queries
-
-SVV_REDSHIFT_DATABASES_QUERY = """
-SELECT
-    database_name,
-    database_owner,
-    database_type,
-    database_acl,
-    database_options,
-    database_isolation_level
-FROM pg_catalog.svv_redshift_databases
-ORDER BY database_name;
-"""
-
-SVV_ALL_SCHEMAS_QUERY = """
-SELECT
-    database_name,
-    schema_name,
-    schema_owner,
-    schema_type,
-    schema_acl,
-    source_database,
-    schema_option
-FROM pg_catalog.svv_all_schemas
-WHERE database_name = :database_name
-ORDER BY schema_name;
-"""
-
-SVV_ALL_TABLES_QUERY = """
-SELECT
-    database_name,
-    schema_name,
-    table_name,
-    table_acl,
-    table_type,
-    remarks
-FROM pg_catalog.svv_all_tables
-WHERE database_name = :database_name AND schema_name = :schema_name
-ORDER BY table_name;
-"""
-
-SVV_ALL_COLUMNS_QUERY = """
-SELECT
-    database_name,
-    schema_name,
-    table_name,
-    column_name,
-    ordinal_position,
-    column_default,
-    is_nullable,
-    data_type,
-    character_maximum_length,
-    numeric_precision,
-    numeric_scale,
-    remarks
-FROM pg_catalog.svv_all_columns
-WHERE database_name = :database_name AND schema_name = :schema_name AND table_name = :table_name
-ORDER BY ordinal_position;
-"""
+# SQL discovery commands. Results are read positionally; {placeholders} are
+# filled with quoted identifiers by the caller.
+DATABASES_SQL = 'SHOW DATABASES;'
+SCHEMAS_SQL = 'SHOW SCHEMAS FROM DATABASE {database};'
+TABLES_SQL = 'SHOW TABLES FROM SCHEMA {database}.{schema};'
+COLUMNS_SQL = 'SHOW COLUMNS FROM TABLE {database}.{schema}.{table};'
 
 # SQL guardrails
 
-# Single-lines comments.
-re_slc = r'--.*?$'
+# Read-only guard limits and deny-list (used by sql_guard.py; sqlglot AST-based).
 
+# Maximum SQL length accepted before parsing; longer input is rejected (fail closed).
+MAX_SQL_LEN = 65_536
 
-def re_mlc(g: int) -> str:
-    """Multi-line comments, considering balanced recursion."""
-    return rf'(?P<mlc{g}>(?:\/\*)(?:[^\/\*]|\/[^\*]|\*[^\/]|(?P>mlc{g}))*(?:\*\/))'
-
-
-def re_sp(g: int) -> str:
-    """Whitespaces, comments, semicolons which can occur between words."""
-    return rf'({re_slc}|{re_mlc(g)}|\s|;)'
-
-
-# We consider `(END|COMMIT|ROLLBACK|ABORT) [WORK|TRANSACTION]` as a breaker for the `BEGIN READ ONLY; {sql}; END;`
-# guarding wrapper, having there might be variations of whitespaces and comments in the construct.
-SUSPICIOUS_QUERY_REGEXP = rf'(?im)(^|;){re_sp(1)}*(END|COMMIT|ROLLBACK|ABORT)({re_sp(2)}+(WORK|TRANSACTION))?{re_sp(3)}*;'
+# Operations denied in read-only mode. Each keyword maps to a sqlglot AST node type
+# (or bare-command name) in sql_guard.py; matched structurally, not by leading text.
+# Fixed internal constant -- not operator-configurable.
+READ_ONLY_DENY_LIST = frozenset(
+    {
+        'UNLOAD',
+        'BEGIN',
+        'START',
+        'COMMIT',
+        'END',
+        'ROLLBACK',
+        'ABORT',
+        'TRUNCATE',
+        'CALL',
+        'GRANT',
+        'REVOKE',
+        'VACUUM',
+        'ANALYZE',
+        'COMMENT',
+        'CANCEL',
+    }
+)

@@ -37,47 +37,14 @@ def mock_config():
     config.version = '1.0.0'
     config.transport = 'stdio'
     return config
-    return config
 
 
-@patch('awslabs.openapi_mcp_server.server.FastMCPOpenAPI')
-@patch('awslabs.openapi_mcp_server.server.FastMCP')
-@patch('awslabs.openapi_mcp_server.server.load_openapi_spec')
-@patch('awslabs.openapi_mcp_server.server.validate_openapi_spec', return_value=True)
-@patch('awslabs.openapi_mcp_server.server.HttpClientFactory.create_client')
-def test_create_mcp_server_basic(
-    mock_create_client,
-    mock_validate,
-    mock_load_spec,
-    mock_fastmcp,
-    mock_fastmcp_openapi,
-    mock_config,
-):
-    """Test creating an MCP server with basic configuration."""
-    # Setup mocks
-    mock_server = MagicMock()
-    mock_fastmcp.return_value = MagicMock()
-    mock_fastmcp_openapi.return_value = mock_server
-    mock_load_spec.return_value = {
-        'openapi': '3.0.0',
-        'info': {'title': 'Test API', 'version': '1.0.0'},
-        'paths': {},
-    }
-    mock_client = MagicMock()
-    mock_create_client.return_value = mock_client
-
-    # Call the function
-    result = create_mcp_server(mock_config)
-
-    # Verify the result
-    assert result == mock_server
-    mock_fastmcp.assert_called_once()
-    mock_load_spec.assert_called_once_with(
-        url=mock_config.api_spec_url, path=mock_config.api_spec_path
-    )
-    mock_validate.assert_called_once()
-    mock_create_client.assert_called_once()
-    mock_fastmcp_openapi.assert_called_once()
+# NOTE: ``test_create_mcp_server_basic`` and ``test_create_mcp_server_invalid_spec``
+# here duplicated the ones in test_server.py and asserted low-level
+# ``FastMCP``/``OpenAPIProvider`` construction mechanics now owned by
+# ``from_openapi``. They were removed in the FastMCP-native migration; the
+# error-path tests below remain, and the invalid-spec behavior is covered in
+# test_server.py.
 
 
 @patch('awslabs.openapi_mcp_server.server.FastMCP')
@@ -102,7 +69,7 @@ def test_create_mcp_server_missing_spec(
     # Verify that the logger.error was called with the right message
     mock_logger.error.assert_any_call('No API spec URL or path provided')
     # Verify other expected behaviors
-    mock_fastmcp.assert_called_once()
+    mock_fastmcp.assert_not_called()
     mock_load_spec.assert_not_called()
     # Verify that sys.exit was called with exit code 1
     mock_exit.assert_called_once_with(1)
@@ -135,45 +102,11 @@ def test_create_mcp_server_missing_base_url(
     # Verify that the logger.error was called with the right message
     mock_logger.error.assert_any_call('No API base URL provided')
     # Verify other expected behaviors
-    mock_fastmcp.assert_called_once()
+    mock_fastmcp.assert_not_called()
     mock_load_spec.assert_called_once()
     mock_validate.assert_called_once()
     # Verify that sys.exit was called with exit code 1
     mock_exit.assert_called_once_with(1)
 
 
-@patch('awslabs.openapi_mcp_server.server.FastMCPOpenAPI')
-@patch('awslabs.openapi_mcp_server.server.FastMCP')
-@patch('awslabs.openapi_mcp_server.server.load_openapi_spec')
-@patch('awslabs.openapi_mcp_server.server.validate_openapi_spec', return_value=False)
-@patch('awslabs.openapi_mcp_server.server.HttpClientFactory.create_client')
-def test_create_mcp_server_invalid_spec(
-    mock_create_client,
-    mock_validate,
-    mock_load_spec,
-    mock_fastmcp,
-    mock_fastmcp_openapi,
-    mock_config,
-):
-    """Test creating an MCP server with an invalid OpenAPI spec."""
-    # Setup mocks
-    mock_server = MagicMock()
-    mock_fastmcp.return_value = MagicMock()
-    mock_fastmcp_openapi.return_value = mock_server
-    mock_load_spec.return_value = {
-        'info': {'title': 'Test API', 'version': '1.0.0'},
-        'paths': {},
-    }  # Missing openapi field
-    mock_client = MagicMock()
-    mock_create_client.return_value = mock_client
-
-    # Call the function
-    result = create_mcp_server(mock_config)
-
-    # Verify the result - should continue despite validation failure
-    assert result == mock_server
-    mock_fastmcp.assert_called_once()
-    mock_load_spec.assert_called_once()
-    mock_validate.assert_called_once()
-    mock_create_client.assert_called_once()
-    mock_fastmcp_openapi.assert_called_once()
+# (invalid-spec behavior is covered by test_server.py::test_create_mcp_server_invalid_spec)
