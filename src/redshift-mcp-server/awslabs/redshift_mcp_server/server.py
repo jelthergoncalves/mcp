@@ -43,6 +43,14 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 
+def _to_query_result(data: dict) -> QueryResult:
+    """Build a QueryResult, keeping at most MCP_REDSHIFT_MAX_ROWS rows (unset or 0 = no cap)."""
+    max_rows = int(os.environ.get('MCP_REDSHIFT_MAX_ROWS') or 0)
+    if max_rows > 0 and len(data['rows']) > max_rows:
+        data = {**data, 'rows': data['rows'][:max_rows], 'truncated': True}
+    return QueryResult(**data)
+
+
 # Remove default handler and add custom configuration
 logger.remove()
 logger.add(
@@ -650,7 +658,7 @@ async def execute_query_tool(
         )
 
         # Convert to QueryResult model
-        query_result = QueryResult(**query_result_data)
+        query_result = _to_query_result(query_result_data)
 
         logger.info(
             f'Successfully executed query on cluster {cluster_identifier}: {query_result.row_count} rows returned'
@@ -703,7 +711,7 @@ async def execute_query_rw_tool(
             allow_read_write=True,
         )
 
-        query_result = QueryResult(**query_result_data)
+        query_result = _to_query_result(query_result_data)
 
         logger.info(
             f'Successfully executed read-write query on cluster {cluster_identifier}: {query_result.row_count} rows returned'
