@@ -155,5 +155,9 @@ class QueryResult(BaseModel):
 
     columns: list[str] = Field(..., description='List of column names in the result set')
     rows: list[list] = Field(..., description='List of rows, where each row is a list of values')
-    row_count: int = Field(..., description='Number of rows returned')
+    row_count: int = Field(..., description='Total number of rows the query produced')
     query_id: str = Field(..., description='Unique identifier for the query execution')
+    truncated: bool = Field(
+        False,
+        description='True when rows was cut to MCP_REDSHIFT_MAX_ROWS; row_count is the total',
+    )
